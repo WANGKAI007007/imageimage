@@ -69,14 +69,29 @@ def get_access_token(api_key, secret_key):
         return None
 
 
-def preprocess_image(image_path):
+def preprocess_image(image_path, max_size=4096, min_size=15, max_file_size=4*1024*1024):
     image = Image.open(image_path)
-    # 可以根据需要调整对比度、亮度等
-    image = Image.open(image_path).convert("RGB")  # Add .convert("RGB") to ensure the image is in RGB mode
-    enhancer = ImageEnhance.Contrast(image)
-    enhanced_image = enhancer.enhance(1.5)
+    # 调整图像尺寸
+    width, height = image.size
+    if width > max_size or height > max_size:
+        ratio = min(max_size / width, max_size / height)
+        new_width, new_height = int(width * ratio), int(height * ratio)
+        image = image.resize((new_width, new_height), Image.ANTIALIAS)
+    elif width < min_size or height < min_size:
+        ratio = max(min_size / width, min_size / height)
+        new_width, new_height = int(width * ratio), int(height * ratio)
+        image = image.resize((new_width, new_height), Image.ANTIALIAS)
 
-    return enhanced_image
+    # 检查文件大小
+    image.save("temp.jpg", quality=95)
+    file_size = os.path.getsize("temp.jpg")
+    quality = 95
+    while file_size > max_file_size and quality > 10:
+        quality -= 5
+        image.save("temp.jpg", quality=quality)
+        file_size = os.path.getsize("temp.jpg")
+
+    return "temp.jpg"
 
 def extract_invoice_fields(text):
     invoice_code_pattern = r'\d{10,12}'
