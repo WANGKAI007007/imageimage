@@ -15,6 +15,7 @@ import requests
 import tkinter as tk
 from PIL import Image, ImageEnhance
 from openpyxl import Workbook
+import time
 
 
 class TextHandler(logging.Handler):
@@ -69,7 +70,28 @@ def get_access_token(api_key, secret_key):
         return None
 
 
-def preprocess_image(image_path, max_size=4096, min_size=15, max_file_size=4*1024*1024):
+
+def extract_invoice_fields(text):
+    invoice_code_pattern = r'\d{10,12}'
+    invoice_number_pattern = r'\d{8}'
+
+    invoice_code = re.findall(invoice_code_pattern, text)
+    invoice_number = re.findall(invoice_number_pattern, text)
+
+    if invoice_code:
+        invoice_code = invoice_code[0]
+    else:
+        invoice_code = ''
+
+    if invoice_number:
+        invoice_number = invoice_number[0]
+    else:
+        invoice_number = ''
+
+    return {'发票代码': invoice_code, '发票号码': invoice_number}
+
+
+def preprocess_image(image_path, max_size=4096, min_size=15, max_file_size=4 * 1024 * 1024):
     image = Image.open(image_path)
     # 调整图像尺寸
     width, height = image.size
@@ -93,55 +115,47 @@ def preprocess_image(image_path, max_size=4096, min_size=15, max_file_size=4*102
 
     return "temp.jpg"
 
-def extract_invoice_fields(text):
-    invoice_code_pattern = r'\d{10,12}'
-    invoice_number_pattern = r'\d{8}'
-
-    invoice_code = re.findall(invoice_code_pattern, text)
-    invoice_number = re.findall(invoice_number_pattern, text)
-
-    if invoice_code:
-        invoice_code = invoice_code[0]
-    else:
-        invoice_code = ''
-
-    if invoice_number:
-        invoice_number = invoice_number[0]
-    else:
-        invoice_number = ''
-
-    return {'发票代码': invoice_code, '发票号码': invoice_number}
 
 def get_vehicle_invoice_result(image_path, access_token):
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/vehicle_invoice?access_token={access_token}"
-
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json'
-    }
-
+    # 对图片进行预处理，压缩尺寸并调整图像质量
     enhanced_image = preprocess_image(image_path)
-    img_data = io.BytesIO()
-    enhanced_image.save(img_data, format='JPEG')
-    img_base64 = base64.b64encode(img_data.getvalue())
 
-    data = {'image': img_base64}
-    response = requests.post(url, headers=headers, data=data)
-    result = response.json()
+    # 发送 POST 请求到 OCR API
+    with open(enhanced_image, 'rb') as f:
+        img_data = f.read()
 
-    if 'error_code' in result:
-        logging.warning('Error code: %s', result['error_code'])
-        logging.warning('Error message: %s', result['error_msg'])
-        return None
-    print(result)
-    text = " ".join(result['words_result'].values())
+    # 使用百度 OCR API 进行识别
+    response = requests.post(
+        'https://aip.baidubce.com/rest/2.0/ocr/v1/vehicle_invoice?access_token={}'.format(access_token),
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        data={'image': base64.b64encode(img_data)},
+    )
 
+    # 延迟2秒钟
+    time.sleep(2)
 
+    if response.status_code != 200:
+        raise ValueError('OCR API returned unexpected status code: {}'.format(response.status_code))
 
-    extracted_fields = extract_invoice_fields(text)
+    # 从响应中提取识别结果
+    json_data = response.json()
+    if 'error_msg' in json_data:
+        raise ValueError(json_data['error_msg'])
 
-    return extracted_fields
-
+    # 解析识别结果，提取车辆发票信息
+    words_result = json_data['words_result']
+    invoice_fields = {}
+    for field in words_result:
+        if field['words'] in ['车辆类型', '厂牌型号', '车架号码', '发动机号码', '税率', '不含税金额', '税额',
+                              '价税合计']:
+            key = field['words']
+            value = words_result[words_result.index(field) + 1]['words']
+            invoice_fields[key] = value
+        elif field['words'] in ['发票代码', '发票号码', '开票日期', '购买方名称', '销货单位名称']:
+            key = field['words']
+            value = field['value']
+            invoice_fields[key] = value
+    return invoice_fields
 def get_ocr_result(image_path, access_token):
     try:
         url = "https://aip.baidubce.com/rest/2.0/ocr/v1/vehicle_license"
@@ -168,6 +182,12 @@ def get_ocr_result(image_path, access_token):
         logging.error(e)
         return None
 
+def clean_string(s):
+    # 根据需要添加更多非法字符
+    illegal_characters = ['\x00', '\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07', '\x08', '\x0B', '\x0C', '\x0E', '\x0F', '\x10', '\x11', '\x12', '\x13', '\x14', '\x15', '\x16', '\x17', '\x18', '\x19', '\x1A', '\x1B', '\x1C', '\x1D', '\x1E', '\x1F', '\x7F']
+    for ch in illegal_characters:
+        s = s.replace(ch, '')
+    return s
 
 def process_directory(directory_path, access_token, text_widget, root, is_invoice=False):
     # 创建 checkpoint.csv 文件（如果尚不存在）
@@ -182,10 +202,12 @@ def process_directory(directory_path, access_token, text_widget, root, is_invoic
 
     headers = ['子文件夹名称', '号牌号码', '车辆类型', '所有人', '住址', '发证单位', '使用性质', '品牌型号',
                '车辆识别代号', '发动机号码', '注册日期', '发证日期']
-    headers_invoice = ['子文件夹名称', '发票代码', '发票号码', '开票日期', '购买方名称', '销货单位名称', '车辆类型',
-                       '厂牌型号', '车架号码', '发动机号码', '税率', '不含税价格', '税额', '价税合计']
+    headers_invoice = ['子文件夹名称', '开票日期', '机器编号', '购买方名称', '购买方身份证号码/组织机构代码', '车辆类型', '厂牌型号', '产地', '合格证号', '发动机号码', '车架号码', '价税合计', '价税合计小写', '销货单位名称', '销货单位电话', '销货单位纳税人识别号', '销货单位账号', '销货单位地址', '销货单位开户银行', '税率', '税额', '主管税务机关', '主管税务机关代码', '不含税价格', '限乘人数']
 
-    data = []
+    # 创建一个新的 Excel 文件
+    wb = Workbook()
+    ws = wb.active
+    ws.append(headers_invoice if is_invoice else headers)
 
     # 遍历文件夹下的所有子文件夹
     for subdir_name in os.listdir(directory_path):
@@ -214,14 +236,18 @@ def process_directory(directory_path, access_token, text_widget, root, is_invoic
             # 根据 is_invoice 参数选择 OCR 函数
             if is_invoice:
                 invoice_fields = get_vehicle_invoice_result(image_path, access_token)
-                row_data = [subdir_name] + [invoice_fields.get(key, '') for key in headers_invoice[1:]]
+                row_data = [subdir_name] + [clean_string(invoice_fields.get(key, '')) for key in headers_invoice[1:]]
             else:
                 words_result = get_ocr_result(image_path, access_token)
-                row_data = [subdir_name] + [words_result.get(key, {}).get('words', '') for key in headers[1:]]
+                if words_result is not None:
+                    row_data = [subdir_name] + [clean_string(words_result.get(key, {}).get('words', '')) for key in
+                                                headers[1:]]
+                else:
+                    row_data = [subdir_name] + ['' for _ in headers[1:]]
 
             if row_data:
-                # 将 row_data 追加到总数据 data 中
-                data.append(row_data)
+                # 将 row_data 追加到 Excel 文件中
+                ws.append(row_data)
             else:
                 logging.warning(f'Failed to process image: {image_path}')
 
@@ -229,32 +255,29 @@ def process_directory(directory_path, access_token, text_widget, root, is_invoic
         with open(checkpoint_file, 'a') as f:
             f.write(f'{subdir_name}\n')
 
-    # 将结果保存到 Excel 文件
-    if len(data) > 0:
-        wb = save_to_excel(data, headers_invoice if is_invoice else headers, is_invoice)
-        file_path = filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=[("Excel files", "*.xlsx")])
-        if file_path:
-            if not file_path.endswith(".xlsx"):
-                file_path += ".xlsx"
-            try:
-                wb.save(file_path)
-                logging.info("Saving data to Excel file.")
-                messagebox.showinfo("保存成功", "Excel 文件保存成功！")
-                if messagebox.askyesno("打开文件夹", "Excel 文件保存成功，是否打开所在文件夹？"):
-                    directory = os.path.dirname(file_path)
-                    if sys.platform == "win32":
-                        os.startfile(directory)
-                    elif sys.platform == "darwin":
-                        subprocess.Popen(["open", directory])
-                    else:
-                        subprocess.Popen(["xdg-open", directory])
-            except Exception as e:
-                logging.error("Failed to save data to Excel file: %s", e)
-                messagebox.showerror("保存失败", "Excel 文件保存失败！")
+    # 保存 Excel 文件
+    file_path = filedialog.asksaveasfilename(defaultextension='.xlsx', filetypes=[("Excel files", "*.xlsx")])
+    if file_path:
+        if not file_path.endswith(".xlsx"):
+            file_path += ".xlsx"
+        try:
+            wb.save(file_path)
+            logging.info("Saving data to Excel file.")
+            messagebox.showinfo("保存成功", "Excel 文件保存成功！")
+            if messagebox.askyesno("打开文件夹", "Excel 文件保存成功，是否打开所在文件夹？"):
+                directory = os.path.dirname(file_path)
+                if sys.platform == "win32":
+                    os.startfile(directory)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", directory])
+                else:
+                    subprocess.Popen(["xdg-open", directory])
+        except Exception as e:
+            logging.error("Failed to save data to Excel file: %s", e)
+            messagebox.showerror("保存失败", "Excel 文件保存失败！")
     else:
         logging.warning(f'No data found. Skip saving data to Excel file.')
         messagebox.showwarning("无数据", "没有找到数据，Excel 文件未保存。")
-
 
 def save_to_excel(data, headers, is_invoice=False):
     wb = Workbook()
